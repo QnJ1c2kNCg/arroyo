@@ -182,12 +182,7 @@ impl KubernetesScheduler {
                 .push(serde_json::to_value(var).unwrap());
         }
 
-        let owner: Vec<_> = config()
-            .kubernetes_scheduler
-            .controller
-            .iter()
-            .cloned()
-            .collect();
+        let owner: Vec<_> = c.controller.iter().cloned().collect();
 
         let command: Vec<_> = shlex::split(&c.worker.command).expect("cannot split command");
 

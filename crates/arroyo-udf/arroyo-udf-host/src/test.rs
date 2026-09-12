@@ -3,7 +3,10 @@ use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, Int32Array, StringArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field};
-use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 mod test_udf_1 {
@@ -60,6 +63,7 @@ fn test_udf() {
         arg_fields: vec![],
         number_rows: 3,
         return_field: Field::new("return", (*sync_udf.return_type).clone(), false).into(),
+        config_options: Arc::default(),
     };
 
     let result = sync_udf.invoke_with_args(args).unwrap();
@@ -89,6 +93,7 @@ fn test_optional_arg() {
         arg_fields: vec![],
         number_rows: 1,
         return_field: Field::new("return", (*sync_udf.return_type).clone(), false).into(),
+        config_options: Arc::default(),
     };
 
     let result = sync_udf.invoke_with_args(args).unwrap();
@@ -102,6 +107,30 @@ fn test_optional_arg() {
     assert_eq!(result.value(0), &[1, 2, 3]);
     assert!(result.is_null(1));
     assert_eq!(result.value(2), &[4, 5]);
+}
+
+#[test]
+fn planner_identity_uses_name_and_signature_not_library_handles() {
+    let first: SyncUdfDylib = (&test_udf_1::__local().config).try_into().unwrap();
+    let second: SyncUdfDylib = (&test_udf_1::__local().config).try_into().unwrap();
+    assert!(!Arc::ptr_eq(&first.udf, &second.udf));
+    let mut renamed = first.clone();
+    renamed.name = Arc::new("renamed".into());
+    let mut changed_signature = first.clone();
+    changed_signature.signature = Arc::new(Signature::any(3, Volatility::Volatile));
+
+    let first = ScalarUDF::from(first);
+    let second = ScalarUDF::from(second);
+    assert_eq!(first, second);
+    assert_eq!(first, first.clone());
+    let hash = |udf: &ScalarUDF| {
+        let mut hasher = DefaultHasher::new();
+        udf.hash(&mut hasher);
+        hasher.finish()
+    };
+    assert_eq!(hash(&first), hash(&second));
+    assert_ne!(first, ScalarUDF::from(renamed));
+    assert_ne!(first, ScalarUDF::from(changed_signature));
 }
 
 mod test_udaf {

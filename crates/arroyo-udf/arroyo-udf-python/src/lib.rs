@@ -13,8 +13,8 @@ use arroyo_udf_common::parse::NullableType;
 use datafusion::common::Result as DFResult;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature};
-use std::any::Any;
 use std::fmt::Debug;
+use std::hash::{Hash, Hasher};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
@@ -36,11 +36,23 @@ pub struct PythonUDF {
     pub return_type: Arc<NullableType>,
 }
 
-impl ScalarUDFImpl for PythonUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
+// Preserve DF48's default name/signature identity, excluding interpreter state.
+impl PartialEq for PythonUDF {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.signature == other.signature
     }
+}
 
+impl Eq for PythonUDF {}
+
+impl Hash for PythonUDF {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.signature.hash(state);
+    }
+}
+
+impl ScalarUDFImpl for PythonUDF {
     fn name(&self) -> &str {
         &self.name
     }
@@ -107,5 +119,49 @@ impl PythonUDF {
         {
             anyhow::bail!(NOT_ENABLED_ERROR)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::logical_expr::{ScalarUDF, Volatility};
+    use std::hash::DefaultHasher;
+    use std::sync::mpsc::sync_channel;
+
+    fn udf(name: &str, signature: Signature) -> PythonUDF {
+        let (task_tx, _) = sync_channel(1);
+        let (_, result_rx) = sync_channel(1);
+        PythonUDF {
+            name: Arc::new(name.into()),
+            task_tx,
+            result_rx: Arc::new(Mutex::new(result_rx)),
+            definition: Arc::new("identity-test".into()),
+            signature: Arc::new(signature),
+            arg_types: Arc::new(vec![NullableType::not_null(DataType::Int64)]),
+            return_type: Arc::new(NullableType::not_null(DataType::Int64)),
+        }
+    }
+
+    #[test]
+    fn planner_identity_uses_name_and_signature_not_interpreter_channels() {
+        let signature = Signature::exact(vec![DataType::Int64], Volatility::Immutable);
+        let first = ScalarUDF::from(udf("identity", signature.clone()));
+        let second = ScalarUDF::from(udf("identity", signature.clone()));
+        assert_eq!(first, second);
+        let hash = |udf: &ScalarUDF| {
+            let mut hasher = DefaultHasher::new();
+            udf.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(hash(&first), hash(&second));
+        assert_ne!(first, ScalarUDF::from(udf("renamed", signature)));
+        assert_ne!(
+            first,
+            ScalarUDF::from(udf(
+                "identity",
+                Signature::exact(vec![DataType::Int64], Volatility::Volatile)
+            ))
+        );
     }
 }

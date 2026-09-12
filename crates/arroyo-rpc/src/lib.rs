@@ -34,7 +34,7 @@ use datafusion::common::{
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::sqlparser::ast::ValueWithSpan;
-use datafusion::logical_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
+use datafusion::logical_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF};
 use datafusion::sql::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion::sql::sqlparser::ast::{Expr, SqlOption, Value as SqlValue};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
@@ -461,6 +461,10 @@ impl ContextProvider for EmptyContextProvider {
         None
     }
 
+    fn get_higher_order_meta(&self, _: &str) -> Option<Arc<HigherOrderUDF>> {
+        None
+    }
+
     fn get_variable_type(&self, _: &[String]) -> Option<DataType> {
         None
     }
@@ -478,6 +482,10 @@ impl ContextProvider for EmptyContextProvider {
     }
 
     fn udwf_names(&self) -> Vec<String> {
+        vec![]
+    }
+
+    fn higher_order_function_names(&self) -> Vec<String> {
         vec![]
     }
 }
@@ -1270,7 +1278,7 @@ pub struct StateContext {
 
 #[cfg(test)]
 mod tests {
-    use crate::{DataSizeUnit, SerializableBytes, parse_expr};
+    use crate::{DataSizeUnit, SerializableBytes, contextless_sql_to_expr, parse_expr};
     use bincode::{Decode, Encode, config};
     use bytes::Bytes;
 
@@ -1279,6 +1287,22 @@ mod tests {
         let sql = "concat(1 + hello, 'blah')";
         let parsed = parse_expr(sql).unwrap();
         assert_eq!(parsed.to_string(), sql);
+    }
+
+    #[test]
+    fn contextless_planning_accepts_literals_and_rejects_unknown_functions() {
+        assert_eq!(
+            contextless_sql_to_expr(parse_expr("1").unwrap(), None).unwrap(),
+            datafusion::logical_expr::lit(1i64)
+        );
+        let error =
+            contextless_sql_to_expr(parse_expr("missing_function(1)").unwrap(), None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("No functions registered with this context"),
+            "{error}"
+        );
     }
 
     #[test]

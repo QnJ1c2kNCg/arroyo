@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use arroyo_datastream::logical::{
     LogicalEdge, LogicalEdgeType, LogicalGraph, LogicalNode, LogicalProgram, OperatorName,
     ProgramConfig,
@@ -410,6 +410,7 @@ async fn run_pipeline_and_assert_outputs(
     golden_output_location: String,
     udfs: &[LocalUdf],
     primary_keys: Option<&[&str]>,
+    comparison: &OutputComparison,
 ) {
     // remove output_location before running the pipeline
     if std::path::Path::new(&output_location).exists() {
@@ -425,6 +426,7 @@ async fn run_pipeline_and_assert_outputs(
         output_location.clone(),
         golden_output_location.clone(),
         primary_keys,
+        comparison,
         &mut control_rx,
     )
     .await;
@@ -473,6 +475,7 @@ async fn run_pipeline_and_assert_outputs(
         output_location,
         golden_output_location,
         primary_keys,
+        comparison,
     )
     .await;
 }
@@ -483,6 +486,7 @@ async fn run_completely(
     output_location: String,
     golden_output_location: String,
     primary_keys: Option<&[&str]>,
+    comparison: &OutputComparison,
     control_rx: &mut Receiver<ControlResp>,
 ) {
     let engine = Engine::for_local(program, "pipe-local".to_string(), job_id.to_string())
@@ -497,6 +501,7 @@ async fn run_completely(
         output_location.clone(),
         golden_output_location,
         primary_keys,
+        comparison,
     )
     .await;
     if std::path::Path::new(&output_location).exists() {
@@ -584,6 +589,151 @@ fn order_by_pk(lines: HashSet<Value>, pks: Option<&[&str]>) -> Vec<Value> {
     lines
 }
 
+#[derive(Debug)]
+struct NumericTolerance {
+    field: String,
+    absolute: f64,
+    relative: f64,
+}
+
+#[derive(Debug)]
+struct ApproximateComparison {
+    field: String,
+    reference: String,
+    max_absolute_error: f64,
+}
+
+#[derive(Debug, Default)]
+struct OutputComparison {
+    numeric_tolerances: Vec<NumericTolerance>,
+    approximate: Vec<ApproximateComparison>,
+}
+
+impl OutputComparison {
+    fn from_query(query: &str) -> Result<Self> {
+        let mut comparison = Self::default();
+        for line in query.lines().map(str::trim) {
+            if let Some(spec) = line.strip_prefix("--numeric-tolerance=") {
+                for entry in spec.split(',') {
+                    let parts = entry.split(':').collect::<Vec<_>>();
+                    ensure!(
+                        parts.len() == 3,
+                        "numeric tolerance must be field:absolute:relative"
+                    );
+                    comparison.numeric_tolerances.push(NumericTolerance {
+                        field: parts[0].to_string(),
+                        absolute: parts[1]
+                            .parse()
+                            .with_context(|| format!("invalid absolute tolerance in {entry}"))?,
+                        relative: parts[2]
+                            .parse()
+                            .with_context(|| format!("invalid relative tolerance in {entry}"))?,
+                    });
+                }
+            }
+            if let Some(spec) = line.strip_prefix("--approximate=") {
+                for entry in spec.split(',') {
+                    let parts = entry.split(':').collect::<Vec<_>>();
+                    ensure!(
+                        parts.len() == 3,
+                        "approximate comparison must be field:reference:max-absolute-error"
+                    );
+                    comparison.approximate.push(ApproximateComparison {
+                        field: parts[0].to_string(),
+                        reference: parts[1].to_string(),
+                        max_absolute_error: parts[2].parse().with_context(|| {
+                            format!("invalid approximate comparison tolerance in {entry}")
+                        })?,
+                    });
+                }
+            }
+        }
+        Ok(comparison)
+    }
+
+    fn is_strict(&self) -> bool {
+        self.numeric_tolerances.is_empty() && self.approximate.is_empty()
+    }
+}
+
+fn apply_output_comparison(
+    actual: &mut [Value],
+    expected: &[Value],
+    comparison: &OutputComparison,
+) {
+    if comparison.is_strict() {
+        return;
+    }
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter_mut().zip(expected) {
+        let actual = actual
+            .as_object_mut()
+            .expect("updating output must be an object");
+        let expected = expected
+            .as_object()
+            .expect("golden output must be an object");
+
+        // JSON has one number type. Treat equivalent integer/float encodings as equal.
+        for (field, expected_value) in expected {
+            if let (Some(actual_number), Some(expected_number)) = (
+                actual.get(field).and_then(Value::as_f64),
+                expected_value.as_f64(),
+            ) && actual_number == expected_number
+            {
+                actual.insert(field.clone(), expected_value.clone());
+            }
+        }
+
+        for tolerance in &comparison.numeric_tolerances {
+            let actual_value = actual
+                .get(&tolerance.field)
+                .and_then(Value::as_f64)
+                .unwrap_or_else(|| panic!("{} must be numeric", tolerance.field));
+            let expected_value = expected
+                .get(&tolerance.field)
+                .and_then(Value::as_f64)
+                .unwrap_or_else(|| panic!("{} must be numeric in the golden", tolerance.field));
+            let allowed = tolerance
+                .absolute
+                .max(tolerance.relative * actual_value.abs().max(expected_value.abs()));
+            assert!(
+                (actual_value - expected_value).abs() <= allowed,
+                "{} values {actual_value} and {expected_value} differ by more than {allowed}",
+                tolerance.field
+            );
+            actual.insert(
+                tolerance.field.clone(),
+                expected.get(&tolerance.field).unwrap().clone(),
+            );
+        }
+
+        for approximate in &comparison.approximate {
+            let actual_value = actual
+                .get(&approximate.field)
+                .and_then(Value::as_f64)
+                .unwrap_or_else(|| panic!("{} must be numeric", approximate.field));
+            let reference = actual
+                .get(&approximate.reference)
+                .and_then(Value::as_f64)
+                .unwrap_or_else(|| panic!("{} must be numeric", approximate.reference));
+            assert!(
+                (actual_value - reference).abs() <= approximate.max_absolute_error,
+                "{} value {actual_value} is not within {} of {} value {reference}",
+                approximate.field,
+                approximate.max_absolute_error,
+                approximate.reference
+            );
+            actual.insert(
+                approximate.field.clone(),
+                expected
+                    .get(&approximate.field)
+                    .unwrap_or_else(|| panic!("{} is missing from the golden", approximate.field))
+                    .clone(),
+            );
+        }
+    }
+}
+
 fn check_debezium(
     name: &str,
     output_location: String,
@@ -591,12 +741,15 @@ fn check_debezium(
     output_lines: Vec<Value>,
     golden_output_lines: Vec<Value>,
     primary_keys: Option<&[&str]>,
+    comparison: &OutputComparison,
 ) {
-    let output_merged = order_by_pk(merge_debezium(output_lines, primary_keys), primary_keys);
+    let mut output_merged = order_by_pk(merge_debezium(output_lines, primary_keys), primary_keys);
     let golden_output_merged = order_by_pk(
         merge_debezium(golden_output_lines, primary_keys),
         primary_keys,
     );
+
+    apply_output_comparison(&mut output_merged, &golden_output_merged, comparison);
 
     similar_asserts::assert_eq!(
         output_merged,
@@ -621,6 +774,7 @@ async fn check_output_files(
     output_location: String,
     golden_output_location: String,
     primary_keys: Option<&[&str]>,
+    comparison: &OutputComparison,
 ) {
     let mut output_lines: Vec<Value> = read_to_string(output_location.clone())
         .await
@@ -657,6 +811,7 @@ async fn check_output_files(
             output_lines,
             golden_output_lines,
             primary_keys,
+            comparison,
         );
         return;
     }
@@ -698,6 +853,8 @@ pub async fn correctness_run_codegen(
     checkpoint_interval: i32,
 ) -> Result<()> {
     let test_name = test_name.into();
+    let query = query.into();
+    let comparison = OutputComparison::from_query(&query)?;
     let parent_directory = std::env::current_dir()
         .unwrap()
         .to_string_lossy()
@@ -717,7 +874,7 @@ pub async fn correctness_run_codegen(
     // replace $input_file with the current directory and then inputs/query_name.json
     let physical_input_dir = format!("{parent_directory}/arroyo-sql-testing/inputs/",);
 
-    let query_string = query.into().replace("$input_dir", &physical_input_dir);
+    let query_string = query.replace("$input_dir", &physical_input_dir);
 
     // replace $output_file with the current directory and then outputs/query_name.json
     let physical_output = format!("{parent_directory}/arroyo-sql-testing/outputs/{test_name}.json");
@@ -737,6 +894,7 @@ pub async fn correctness_run_codegen(
         golden_output_location,
         &udfs,
         primary_keys,
+        &comparison,
     )
     .await;
     Ok(())

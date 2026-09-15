@@ -1,4 +1,6 @@
 --pk=event_type
+--numeric-tolerance=regr_sxx:0:5e-9,regr_sxy:0:5e-9
+--approximate=approx_median_driver:median_driver:2,approx_percentile_cont_driver:median_driver:2,approx_percentile_cont_weighted_driver:median_driver:2
 CREATE TABLE cars (
       timestamp TIMESTAMP NOT NULL,
       driver_id BIGINT,

@@ -3,7 +3,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, FieldRef, Schema};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::functions_aggregate::{
-    average, correlation, count, covariance, stddev, sum, variance,
+    average, correlation, count, covariance, regr, stddev, sum, variance,
 };
 use datafusion::logical_expr::utils::format_state_name;
 use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
@@ -31,7 +31,8 @@ pub(super) fn state_fields(expr: &AggregateFunctionExpr) -> Result<Option<Vec<Fi
         || udf
             .downcast_ref::<covariance::CovariancePopulation>()
             .is_some()
-        || udf.downcast_ref::<correlation::Correlation>().is_some();
+        || udf.downcast_ref::<correlation::Correlation>().is_some()
+        || udf.downcast_ref::<regr::Regr>().is_some();
     if !supported
         || ((is_sum || is_avg)
             && !matches!(
@@ -231,6 +232,15 @@ mod tests {
             covariance::covar_samp_udaf(),
             covariance::covar_pop_udaf(),
             correlation::corr_udaf(),
+            regr::regr_slope_udaf(),
+            regr::regr_intercept_udaf(),
+            regr::regr_count_udaf(),
+            regr::regr_r2_udaf(),
+            regr::regr_avgx_udaf(),
+            regr::regr_avgy_udaf(),
+            regr::regr_sxx_udaf(),
+            regr::regr_syy_udaf(),
+            regr::regr_sxy_udaf(),
         ] {
             continuation(udf, vec![x.clone(), y.clone()])?;
         }

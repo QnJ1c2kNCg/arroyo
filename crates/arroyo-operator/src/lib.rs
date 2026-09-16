@@ -6,9 +6,8 @@ use std::time::{Duration, Instant};
 use std::{collections::HashSet, time::SystemTime};
 
 use crate::inq_reader::InQReader;
-use arrow::array::types::{TimestampNanosecondType, UInt64Type};
-use arrow::array::{Array, PrimitiveArray, RecordBatch, UInt64Array};
-use arrow::compute::kernels::numeric::{div, rem};
+use arrow::array::types::TimestampNanosecondType;
+use arrow::array::{Array, PrimitiveArray, RecordBatch};
 use arroyo_types::{ArrowMessage, CheckpointBarrier, Data, SignalMessage, TaskInfo};
 use bincode::{Decode, Encode};
 
@@ -27,18 +26,7 @@ pub trait TimerT: Data + PartialEq + Eq + 'static {}
 
 impl<T: Data + PartialEq + Eq + 'static> TimerT for T {}
 
-pub fn server_for_hash_array(
-    hash: &PrimitiveArray<UInt64Type>,
-    n: usize,
-) -> anyhow::Result<PrimitiveArray<UInt64Type>> {
-    let range_size = u64::MAX / (n as u64);
-    let range_scalar = UInt64Array::new_scalar(range_size);
-    let server_scalar = UInt64Array::new_scalar(n as u64);
-    let division = div(hash, &range_scalar)?;
-    let mod_array = rem(&division, &server_scalar)?;
-    let result: &PrimitiveArray<UInt64Type> = mod_array.as_any().downcast_ref().unwrap();
-    Ok(result.clone())
-}
+pub use arroyo_rpc::df::server_for_hash_array;
 
 pub enum SourceFinishType {
     // stop messages should be propagated through the dataflow

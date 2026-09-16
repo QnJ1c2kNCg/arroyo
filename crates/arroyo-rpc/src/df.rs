@@ -434,9 +434,88 @@ pub fn server_for_hash_array(
     hash: &PrimitiveArray<UInt64Type>,
     n: usize,
 ) -> Result<PrimitiveArray<UInt64Type>, ArrowError> {
+    if n == 0 {
+        return Err(ArrowError::InvalidArgumentError(
+            "parallelism must be positive".into(),
+        ));
+    }
+    if n == 1 {
+        return Ok(hash.unary(|_| 0));
+    }
     let range_size = u64::MAX / (n as u64) + 1;
     let range_scalar = UInt64Array::new_scalar(range_size);
     let division = div(hash, &range_scalar)?;
     let result: &PrimitiveArray<UInt64Type> = division.as_any().downcast_ref().unwrap();
     Ok(result.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::get_hasher;
+    use arrow_array::{ArrayRef, Int64Array, StringArray};
+    use arroyo_types::{range_for_server, server_for_hash};
+    use datafusion::common::hash_utils::create_hashes;
+
+    #[test]
+    fn hash_partitions_match_checkpoint_ranges_at_boundaries() {
+        for parallelism in [1, 2, 3, 7, 128] {
+            let mut hashes = vec![Some(0), Some(u64::MAX), None];
+            for partition in 0..parallelism {
+                let range = range_for_server(partition, parallelism);
+                hashes.extend([Some(*range.start()), Some(*range.end())]);
+                if *range.start() > 0 {
+                    hashes.push(Some(range.start() - 1));
+                }
+            }
+            let hashes = UInt64Array::from(hashes);
+            let partitions = server_for_hash_array(&hashes, parallelism).unwrap();
+            for (hash, partition) in hashes.iter().zip(partitions.iter()) {
+                assert_eq!(
+                    partition,
+                    hash.map(|h| server_for_hash(h, parallelism) as u64)
+                );
+                if let (Some(hash), Some(partition)) = (hash, partition) {
+                    assert!(range_for_server(partition as usize, parallelism).contains(&hash));
+                }
+            }
+        }
+        assert!(server_for_hash_array(&UInt64Array::from(vec![0]), 0).is_err());
+    }
+
+    #[test]
+    fn routing_hashes_are_repeatable_across_threads_and_batch_boundaries() {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                None,
+                Some(-1),
+                Some(1),
+                Some(0),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("key"),
+                Some(""),
+                None,
+                Some("key"),
+                Some("other"),
+            ])),
+        ];
+        let hash = |columns: &[ArrayRef]| {
+            let mut hashes = vec![0; columns[0].len()];
+            create_hashes(columns, &get_hasher(), &mut hashes).unwrap();
+            hashes
+        };
+        let expected = hash(&columns);
+        assert_eq!(expected[0], expected[3]);
+        let other_columns = columns.clone();
+        assert_eq!(
+            expected,
+            std::thread::spawn(move || hash(&other_columns))
+                .join()
+                .unwrap()
+        );
+        let sliced: Vec<_> = columns.iter().map(|column| column.slice(1, 3)).collect();
+        assert_eq!(hash(&sliced), expected[1..4]);
+    }
 }

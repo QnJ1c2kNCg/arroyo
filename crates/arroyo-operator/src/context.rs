@@ -730,9 +730,9 @@ impl OperatorContext {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{ArrayRef, Int64Array, TimestampNanosecondArray, UInt64Array};
+    use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampNanosecondArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use arroyo_types::to_nanos;
+    use arroyo_types::{range_for_server, to_nanos};
     use std::time::Duration;
 
     use super::*;
@@ -788,8 +788,8 @@ mod tests {
             ),
         ]));
 
-        let (tx1, mut rx1) = batch_bounded(8);
-        let (tx2, mut rx2) = batch_bounded(8);
+        let (tx1, rx1) = batch_bounded(8);
+        let (tx2, rx2) = batch_bounded(8);
 
         let record = RecordBatch::try_new(schema.clone(), columns).unwrap();
 
@@ -839,25 +839,102 @@ mod tests {
 
         drop(collector);
 
-        // pull all messages out of the two queues
-        let mut q1 = vec![];
-        while let Some(m) = rx1.recv().await {
-            q1.push(m);
+        let mut received = vec![];
+        for (worker, mut rx) in [rx1, rx2].into_iter().enumerate() {
+            while let Some(message) = rx.recv().await {
+                let ArrowMessage::Data(batch) = message else {
+                    panic!("expected a data batch");
+                };
+                let mut hashes = vec![0; batch.num_rows()];
+                hash_utils::create_hashes(&[batch.column(0).clone()], &get_hasher(), &mut hashes)
+                    .unwrap();
+                assert!(
+                    hashes
+                        .iter()
+                        .all(|hash| range_for_server(worker, 2).contains(hash))
+                );
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                received.extend(values.values().iter().copied());
+                let timestamps = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap();
+                assert!(
+                    timestamps
+                        .values()
+                        .iter()
+                        .all(|value| *value == to_nanos(timestamp) as i64)
+                );
+            }
         }
+        received.sort_unstable();
+        let mut expected = data;
+        expected.sort_unstable();
+        assert_eq!(received, expected);
+    }
 
-        let mut q2 = vec![];
-        while let Some(m) = rx2.recv().await {
-            q2.push(m);
-        }
-
-        let v1 = &q1[0];
-        for v in &q1[1..] {
-            assert_eq!(v1, v);
-        }
-
-        let v2 = &q2[0];
-        for v in &q2[1..] {
-            assert_eq!(v2, v);
+    #[test]
+    fn keyed_repartition_matches_checkpoint_ranges_at_multiple_parallelisms() {
+        let columns: Vec<(&str, ArrayRef)> = vec![
+            (
+                "key",
+                Arc::new(Int64Array::from(
+                    (0..96)
+                        .map(|i| (i % 5 != 0).then_some(i % 13))
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            (
+                "region",
+                Arc::new(StringArray::from(
+                    (0..96)
+                        .map(|i| match i % 3 {
+                            0 => None,
+                            1 => Some("east"),
+                            _ => Some("west"),
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            ("row_id", Arc::new(UInt64Array::from_iter_values(0..96))),
+        ];
+        let record = RecordBatch::try_from_iter(columns).unwrap();
+        let keys = vec![0, 1];
+        for parallelism in [1, 2, 5] {
+            let mut received = vec![];
+            for input in [record.slice(0, 13), record.slice(13, 83)] {
+                for (worker, batch) in repartition(&input, Some(&keys), parallelism) {
+                    let mut hashes = vec![0; batch.num_rows()];
+                    let key_columns: Vec<_> = keys
+                        .iter()
+                        .map(|index| batch.column(*index).clone())
+                        .collect();
+                    hash_utils::create_hashes(&key_columns, &get_hasher(), &mut hashes).unwrap();
+                    assert!(
+                        hashes
+                            .iter()
+                            .all(|hash| range_for_server(worker, parallelism).contains(hash))
+                    );
+                    let ids = batch
+                        .column(2)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .unwrap();
+                    received.extend(ids.values().iter().copied());
+                }
+            }
+            received.sort_unstable();
+            assert_eq!(received, (0..96).collect::<Vec<u64>>());
+            assert!(
+                repartition(&record.slice(0, 0), Some(&keys), parallelism)
+                    .next()
+                    .is_none()
+            );
         }
     }
 

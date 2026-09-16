@@ -24,17 +24,19 @@ use arroyo_datastream::WindowType;
 
 use builder::NamedNode;
 use datafusion::common::tree_node::TreeNode;
-use datafusion::common::{Column, DFSchema, Result, ScalarValue, not_impl_err, plan_err};
+use datafusion::common::{
+    Column, DFSchema, Result, ScalarValue, TableReference, not_impl_err, plan_err,
+};
 use datafusion::datasource::DefaultTableSource;
 #[allow(deprecated)]
 use datafusion::prelude::SessionConfig;
 
-use datafusion::sql::{TableReference, planner::ContextProvider};
+use datafusion::sql::planner::ContextProvider;
 
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, Extension, LogicalPlan, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, UserDefinedLogicalNode, Volatility, WindowUDF, create_udaf,
+    ColumnarValue, Expr, Extension, HigherOrderUDF, LogicalPlan, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, UserDefinedLogicalNode, Volatility, WindowUDF, create_udaf,
 };
 
 use datafusion::logical_expr::{AggregateUDF, TableSource};
@@ -77,10 +79,9 @@ use datafusion::logical_expr::expr_rewriter::FunctionRewrite;
 use datafusion::logical_expr::planner::ExprPlanner;
 use datafusion::optimizer::Analyzer;
 use datafusion::prelude::col;
-use sqlparser::ast::{OneOrManyWithParens, Statement};
+use sqlparser::ast::{Set, Statement};
 use sqlparser::dialect::ArroyoDialect;
 use sqlparser::parser::{Parser, ParserError};
-use std::any::Any;
 use std::time::{Duration, SystemTime};
 use std::{collections::HashMap, sync::Arc};
 use syn::Item;
@@ -158,11 +159,18 @@ pub fn register_functions(registry: &mut dyn FunctionRegistry) {
 
 /// A UDF implementation that exists only at plan time, and which will be re-planned
 /// into some other form before execution
-#[allow(clippy::type_complexity)]
+#[derive(PartialEq, Eq, Hash)]
 struct PlaceholderUdf {
     name: String,
     signature: Signature,
-    return_type: Arc<dyn Fn(&[DataType]) -> Result<DataType> + Send + Sync + 'static>,
+    return_type: PlaceholderReturnType,
+}
+
+// Include the return semantics in UDF identity; closures cannot be compared or hashed.
+#[derive(PartialEq, Eq, Hash)]
+enum PlaceholderReturnType {
+    Fixed(DataType),
+    ListElement,
 }
 
 impl Debug for PlaceholderUdf {
@@ -172,10 +180,6 @@ impl Debug for PlaceholderUdf {
 }
 
 impl ScalarUDFImpl for PlaceholderUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }
@@ -185,7 +189,14 @@ impl ScalarUDFImpl for PlaceholderUdf {
     }
 
     fn return_type(&self, args: &[DataType]) -> Result<DataType> {
-        (self.return_type)(args)
+        match &self.return_type {
+            PlaceholderReturnType::Fixed(data_type) => Ok(data_type.clone()),
+            PlaceholderReturnType::ListElement => match args.first() {
+                Some(DataType::List(field)) => Ok(field.data_type().clone()),
+                Some(_) => plan_err!("unnest may only be called on arrays"),
+                None => plan_err!("unnest takes one argument"),
+            },
+        }
     }
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -202,7 +213,7 @@ impl PlaceholderUdf {
         Arc::new(ScalarUDF::new_from_impl(PlaceholderUdf {
             name: name.into(),
             signature: Signature::exact(args, Volatility::Volatile),
-            return_type: Arc::new(move |_| Ok(ret.clone())),
+            return_type: PlaceholderReturnType::Fixed(ret),
         }))
     }
 }
@@ -244,16 +255,7 @@ impl ArroyoSchemaProvider {
             .register_udf(Arc::new(ScalarUDF::new_from_impl(PlaceholderUdf {
                 name: "unnest".to_string(),
                 signature: Signature::any(1, Volatility::Volatile),
-                return_type: Arc::new(|args| {
-                    match args.first().ok_or_else(|| {
-                        DataFusionError::Plan("unnest takes one argument".to_string())
-                    })? {
-                        DataType::List(t) => Ok(t.data_type().clone()),
-                        _ => Err(DataFusionError::Plan(
-                            "unnest may only be called on arrays".to_string(),
-                        )),
-                    }
-                }),
+                return_type: PlaceholderReturnType::ListElement,
             })))
             .unwrap();
 
@@ -458,6 +460,14 @@ impl ContextProvider for ArroyoSchemaProvider {
         self.window_functions.get(name).cloned()
     }
 
+    fn get_higher_order_meta(&self, _name: &str) -> Option<Arc<HigherOrderUDF>> {
+        None
+    }
+
+    fn higher_order_function_names(&self) -> Vec<String> {
+        vec![]
+    }
+
     fn udf_names(&self) -> Vec<String> {
         self.functions.keys().cloned().collect()
     }
@@ -477,7 +487,23 @@ impl ContextProvider for ArroyoSchemaProvider {
 
 impl FunctionRegistry for ArroyoSchemaProvider {
     fn udfs(&self) -> HashSet<String> {
-        self.udf_defs.keys().map(|k| k.to_string()).collect()
+        self.functions.keys().cloned().collect()
+    }
+
+    fn udafs(&self) -> HashSet<String> {
+        self.aggregate_functions.keys().cloned().collect()
+    }
+
+    fn udwfs(&self) -> HashSet<String> {
+        self.window_functions.keys().cloned().collect()
+    }
+
+    fn higher_order_function_names(&self) -> HashSet<String> {
+        HashSet::new()
+    }
+
+    fn higher_order_function(&self, name: &str) -> Result<Arc<HigherOrderUDF>> {
+        not_impl_err!("Higher-order function {name} is not supported by Arroyo")
     }
 
     fn udf(&self, name: &str) -> Result<Arc<ScalarUDF>> {
@@ -791,11 +817,13 @@ fn try_handle_set_variable(
     statement: &Statement,
     schema_provider: &mut ArroyoSchemaProvider,
 ) -> Result<bool> {
-    if let Statement::SetVariable {
-        variables, value, ..
-    } = statement
-    {
-        let OneOrManyWithParens::One(opt) = variables else {
+    if let Statement::Set(set) = statement {
+        let Set::SingleAssignment {
+            variable: opt,
+            values: value,
+            ..
+        } = set
+        else {
             return plan_err!("invalid syntax for `SET` call");
         };
 
@@ -1075,11 +1103,11 @@ impl From<(Option<TableReference>, FieldRef)> for DFField {
     }
 }
 
-impl From<(Option<&TableReference>, &Field)> for DFField {
-    fn from(value: (Option<&TableReference>, &Field)) -> Self {
+impl From<(Option<&TableReference>, &FieldRef)> for DFField {
+    fn from(value: (Option<&TableReference>, &FieldRef)) -> Self {
         Self {
             qualifier: value.0.cloned(),
-            field: Arc::new(value.1.clone()),
+            field: value.1.clone(),
         }
     }
 }

@@ -1,5 +1,6 @@
 pub mod metadata;
 pub mod schema;
+mod storage;
 pub mod transforms;
 
 use crate::filesystem::config::{IcebergCatalog, IcebergPartitioning, IcebergSink};
@@ -12,11 +13,11 @@ use arroyo_rpc::connector_err;
 use arroyo_rpc::errors::{DataflowError, DataflowResult, ErrorDomain, RetryHint};
 use arroyo_storage::StorageProvider;
 use arroyo_types::TaskInfo;
-use iceberg::spec::ManifestFile;
+use iceberg::spec::{FormatVersion, ManifestFile};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{Catalog, ErrorKind, TableCreation, TableIdent};
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+use iceberg::{Catalog, CatalogBuilder, ErrorKind, TableCreation, TableIdent};
+use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use itertools::Itertools;
 use regex::Regex;
 use reqwest::Client;
@@ -27,14 +28,17 @@ use std::future::Future;
 use std::iter::once;
 use std::sync::Arc;
 use std::time::Duration;
+use storage::ArroyoStorageFactory;
+use tokio::sync::OnceCell;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-const CONFIG_MAPPINGS: [(&str, &str); 4] = [
+const CONFIG_MAPPINGS: [(&str, &str); 5] = [
     ("s3.region", "aws_region"),
     ("s3.endpoint", "aws_endpoint"),
     ("s3.access-key-id", "aws_access_key_id"),
     ("s3.secret-access-key", "aws_secret_access_key"),
+    ("s3.session-token", "aws_session_token"),
 ];
 
 const ARROYO_COMMIT_ID: &str = "arroyo.commit-id";
@@ -43,13 +47,60 @@ const ICEBERG_COMMIT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 #[derive(Debug)]
 pub struct IcebergTable {
     pub task_info: Option<Arc<TaskInfo>>,
-    pub catalog: RestCatalog,
+    catalog: OnceCell<RestCatalog>,
+    catalog_config: CatalogConfig,
     pub storage_options: HashMap<String, String>,
     pub table_ident: TableIdent,
     pub location_path: Option<String>,
     pub table: Option<Table>,
     pub manifest_files: Vec<ManifestFile>,
     pub partitioning: IcebergPartitioning,
+}
+
+struct CatalogConfig {
+    props: HashMap<String, String>,
+    client: Client,
+}
+
+impl std::fmt::Debug for CatalogConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Properties include catalog tokens and storage credentials.
+        f.debug_struct("CatalogConfig").finish_non_exhaustive()
+    }
+}
+
+fn writer_storage_options(
+    mut config: HashMap<String, String>,
+    storage_options: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut our_config = HashMap::new();
+    for (from, to) in CONFIG_MAPPINGS {
+        if let Some(v) = config.remove(from) {
+            our_config.insert(to.to_string(), v);
+        }
+    }
+
+    if let Some(path_style) = config.remove("s3.path-style-access") {
+        let enabled = matches!(path_style.to_lowercase().as_str(), "true" | "t" | "1");
+        our_config.insert(
+            "virtual_hosted_style_request".to_string(),
+            (!enabled).to_string(),
+        );
+    }
+    our_config.extend(storage_options);
+    our_config
+}
+
+fn ensure_v2(table: &Table) -> DataflowResult<()> {
+    if table.metadata().format_version() != FormatVersion::V2 {
+        return Err(connector_err!(
+            User,
+            NoRetry,
+            "Iceberg sink requires table format v2; found {}",
+            table.metadata().format_version()
+        ));
+    }
+    Ok(())
 }
 
 pub fn to_hex(bytes: &[u8]) -> String {
@@ -184,7 +235,10 @@ impl IcebergTable {
     pub fn new(catalog: &IcebergCatalog, sink: &IcebergSink) -> anyhow::Result<Self> {
         match catalog {
             IcebergCatalog::Rest(rest) => {
-                let mut props = HashMap::new();
+                let mut props = HashMap::from([("uri".to_string(), rest.url.clone())]);
+                if let Some(warehouse) = &rest.warehouse {
+                    props.insert("warehouse".to_string(), warehouse.clone());
+                }
                 if let Some(token) = &rest.token {
                     props.insert("token".to_string(), token.sub_env_vars()?);
                 }
@@ -195,16 +249,17 @@ impl IcebergTable {
                     }
                 }
 
-                let config = RestCatalogConfig::builder()
-                    .uri(rest.url.clone())
-                    .warehouse_opt(rest.warehouse.clone())
-                    .props(props)
-                    .client(Some(
-                        Client::builder().timeout(ICEBERG_COMMIT_TIMEOUT).build()?,
-                    ))
-                    .build();
-
-                let catalog = RestCatalog::new(config);
+                if let Some(virtual_host) = sink.storage_options.get("virtual_hosted_style_request")
+                {
+                    props.insert(
+                        "s3.path-style-access".to_string(),
+                        (!virtual_host.parse::<bool>()?).to_string(),
+                    );
+                }
+                let catalog_config = CatalogConfig {
+                    props,
+                    client: Client::builder().timeout(ICEBERG_COMMIT_TIMEOUT).build()?,
+                };
 
                 let table_ident = TableIdent::from_strs(
                     sink.namespace
@@ -215,7 +270,8 @@ impl IcebergTable {
 
                 Ok(Self {
                     task_info: None,
-                    catalog,
+                    catalog: OnceCell::new(),
+                    catalog_config,
                     location_path: sink.location_path.clone(),
                     storage_options: sink.storage_options.clone(),
                     table_ident,
@@ -225,6 +281,19 @@ impl IcebergTable {
                 })
             }
         }
+    }
+
+    // Operator construction is synchronous; the new catalog builder requires
+    // an async runtime. Initialize on first use, sharing one catalog thereafter.
+    pub async fn catalog(&self) -> iceberg::Result<&RestCatalog> {
+        self.catalog
+            .get_or_try_init(|| {
+                RestCatalogBuilder::default()
+                    .with_client(self.catalog_config.client.clone())
+                    .with_storage_factory(Arc::new(ArroyoStorageFactory))
+                    .load("arroyo", self.catalog_config.props.clone())
+            })
+            .await
     }
 
     pub async fn load_or_create(
@@ -237,14 +306,13 @@ impl IcebergTable {
         }
 
         self.task_info = Some(task_info);
+        let catalog = self.catalog().await.map_err(map_iceberg_error)?;
 
-        if !self
-            .catalog
+        if !catalog
             .namespace_exists(self.table_ident.namespace())
             .await
             .map_err(map_iceberg_error)?
-            && let Err(e) = self
-                .catalog
+            && let Err(e) = catalog
                 .create_namespace(self.table_ident.namespace(), HashMap::new())
                 .await
             && e.kind() != iceberg::ErrorKind::NamespaceAlreadyExists
@@ -252,8 +320,7 @@ impl IcebergTable {
             return Err(map_iceberg_error(e));
         }
 
-        let table = if !self
-            .catalog
+        let table = if !catalog
             .table_exists(&self.table_ident)
             .await
             .map_err(map_iceberg_error)?
@@ -267,8 +334,7 @@ impl IcebergTable {
                 .as_partition_spec(Arc::new(iceberg_schema.clone()))
                 .map_err(map_iceberg_error)?;
 
-            match self
-                .catalog
+            match catalog
                 .create_table(
                     self.table_ident.namespace(),
                     TableCreation::builder()
@@ -276,13 +342,15 @@ impl IcebergTable {
                         .schema(iceberg_schema)
                         .partition_spec(partition_spec)
                         .name(self.table_ident.name.clone())
+                        .format_version(FormatVersion::V2)
+                        // The REST create request forwards properties, not format_version.
+                        .properties(HashMap::from([("format-version".into(), "2".into())]))
                         .build(),
                 )
                 .await
             {
                 Ok(table) => table,
-                Err(e) if e.kind() == iceberg::ErrorKind::TableAlreadyExists => self
-                    .catalog
+                Err(e) if e.kind() == iceberg::ErrorKind::TableAlreadyExists => catalog
                     .load_table(&self.table_ident)
                     .await
                     .map_err(map_iceberg_error)?,
@@ -291,12 +359,13 @@ impl IcebergTable {
                 }
             }
         } else {
-            self.catalog
+            catalog
                 .load_table(&self.table_ident)
                 .await
                 .map_err(map_iceberg_error)?
         };
 
+        ensure_v2(&table)?;
         self.table = Some(table);
 
         Ok(self.table.as_ref().unwrap())
@@ -309,27 +378,8 @@ impl IcebergTable {
     ) -> Result<StorageProvider, DataflowError> {
         let storage_options = self.storage_options.clone();
         let table = self.load_or_create(task_info, schema).await?;
-        let (_, mut config) = table.file_io().clone().into_builder().into_parts();
-
-        let mut our_config = HashMap::new();
-        for (from, to) in CONFIG_MAPPINGS {
-            if let Some(v) = config.remove(from) {
-                our_config.insert(to.to_string(), v);
-            }
-        }
-
-        if let Some(path_style) = our_config.remove("s3.path-style-access") {
-            let path_style = path_style.to_lowercase();
-            let enabled = path_style == "true" || path_style == "t" || path_style == "1";
-            our_config.insert(
-                "virtual_hosted_style_request".to_string(),
-                (!enabled).to_string(),
-            );
-        }
-
-        storage_options.into_iter().for_each(|(k, v)| {
-            our_config.insert(k, v);
-        });
+        let our_config =
+            writer_storage_options(table.file_io().config().props().clone(), storage_options);
 
         let mut location = table.metadata().location().to_string();
         if !location.ends_with('/') {
@@ -343,14 +393,17 @@ impl IcebergTable {
     }
 
     async fn refresh_table(&mut self, operation: &'static str) -> DataflowResult<()> {
-        self.table = Some(
-            run_with_iceberg_timeout(
-                ICEBERG_COMMIT_TIMEOUT,
-                operation,
-                self.catalog.load_table(&self.table_ident),
-            )
-            .await?,
-        );
+        let table = run_with_iceberg_timeout(
+            ICEBERG_COMMIT_TIMEOUT,
+            operation,
+            self.catalog()
+                .await
+                .map_err(map_iceberg_error)?
+                .load_table(&self.table_ident),
+        )
+        .await?;
+        ensure_v2(&table)?;
+        self.table = Some(table);
         Ok(())
     }
 
@@ -407,15 +460,6 @@ impl IcebergTable {
             })
             .try_collect()?;
 
-        // Workaround for iceberg-rust 0.6.0 bug: SnapshotProducer drains added_data_files
-        // before computing the summary, producing all-zero added-* stats. We inject the
-        // correct values via set_snapshot_properties so they appear in the snapshot summary.
-        // Fixed upstream in 0.8.0 (https://github.com/apache/iceberg-rust/pull/1767);
-        // this workaround can be removed when iceberg-rust is upgraded.
-        let added_data_files = files.len().to_string();
-        let added_records: u64 = files.iter().map(|f| f.record_count()).sum();
-        let added_files_size: u64 = files.iter().map(|f| f.file_size_in_bytes()).sum();
-
         // commit the transaction in the rest catalog
         debug!(
             message = "starting iceberg commit",
@@ -426,14 +470,9 @@ impl IcebergTable {
         let tx = tx
             .fast_append()
             .set_snapshot_properties(
-                [
-                    (ARROYO_COMMIT_ID.to_string(), tx_id),
-                    ("added-data-files".to_string(), added_data_files),
-                    ("added-records".to_string(), added_records.to_string()),
-                    ("added-files-size".to_string(), added_files_size.to_string()),
-                ]
-                .into_iter()
-                .collect(),
+                [(ARROYO_COMMIT_ID.to_string(), tx_id)]
+                    .into_iter()
+                    .collect(),
             )
             .add_data_files(files)
             .with_check_duplicate(false)
@@ -443,7 +482,7 @@ impl IcebergTable {
         run_with_iceberg_timeout(
             ICEBERG_COMMIT_TIMEOUT,
             "committing to the Iceberg catalog",
-            tx.commit(&self.catalog),
+            tx.commit(self.catalog().await.map_err(map_iceberg_error)?),
         )
         .await?;
         debug!("finished iceberg catalog commit");

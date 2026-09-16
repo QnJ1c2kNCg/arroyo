@@ -123,7 +123,8 @@ impl IcebergConnector {
         let table = sink::iceberg::IcebergTable::new(&profile.catalog, sink)?;
 
         table
-            .catalog
+            .catalog()
+            .await?
             .namespace_exists(table.table_ident.namespace())
             .await?;
 

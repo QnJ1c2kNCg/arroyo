@@ -19,6 +19,9 @@ pub mod expiring_time_key_map;
 pub mod global_keyed_map;
 pub mod table_manager;
 
+#[cfg(test)]
+mod tests;
+
 /// Trait for bincode'd state struct that can be migrated from earlier versions
 pub trait MigratableState: Data {
     const VERSION: u32;

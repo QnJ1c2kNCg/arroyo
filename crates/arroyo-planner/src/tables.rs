@@ -607,12 +607,22 @@ fn plan_generating_expr(
     schema: &DFSchema,
     schema_provider: &ArroyoSchemaProvider,
 ) -> Result<Expr, DataFusionError> {
-    let sql = format!("SELECT {expr} from {name}");
-    let statement = parse_sql(&sql)
+    let sql = format!("SELECT 1 from {name}");
+    let mut statement = parse_sql(&sql)
         .expect("generating expression should be valid")
         .into_iter()
         .next()
         .expect("generating expression should produce one statement");
+
+    // Reuse the original expression so diagnostics refer to the user's SQL,
+    // not to positions in this synthetic SELECT.
+    if let Statement::Query(query) = &mut statement
+        && let ast::SetExpr::Select(select) = query.body.as_mut()
+    {
+        select.projection = vec![ast::SelectItem::UnnamedExpr(expr.clone())];
+    } else {
+        unreachable!("generating expression must be a SELECT");
+    }
 
     let mut schema_provider = schema_provider.clone();
     schema_provider.insert_table(Table::MemoryTable {
